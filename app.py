@@ -16,6 +16,7 @@ DB_CONFIG = {
     "database": "attendance_db"
 }
 
+
 def get_db():
     return mysql.connector.connect(**DB_CONFIG)
 
