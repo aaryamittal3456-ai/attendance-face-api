@@ -5,49 +5,70 @@ import os
 import json
 import numpy as np
 import mysql.connector
+from mysql.connector import Error
 
 app = Flask(__name__)
 
 # ── MySQL connection ───────────────────────────────────
 DB_CONFIG = {
-    "host": "localhost",
-    "user": "root",
-    "password": "MyNewPasswordUpdated",  # ← change this
-    "database": "attendance_db"
+    "host": os.environ.get("DB_HOST", "localhost"),
+    "user": os.environ.get("DB_USER", "root"),
+    "password": os.environ.get("DB_PASSWORD", "MyNewPasswordUpdated"),
+    "database": os.environ.get("DB_NAME", "attendance_db"),
+    "port": int(os.environ.get("DB_PORT", 3306))
 }
 
 
 def get_db():
-    return mysql.connector.connect(**DB_CONFIG)
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        return conn
+    except Error as e:
+        raise Exception(f"Database connection failed: {str(e)}")
+
+
+# ── Health check ───────────────────────────────────────
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "running", "message": "Attendance Face API is live"})
+
 
 # ── Enroll a student ───────────────────────────────────
 @app.route("/enroll", methods=["POST"])
 def enroll():
     data = request.json
-    name      = data["name"]
-    roll_no   = data["roll_no"]
+    if not data:
+        return jsonify({"success": False, "error": "No JSON body received"}), 400
+
+    name      = data.get("name")
+    roll_no   = data.get("roll_no")
     email     = data.get("email", "")
     section   = data.get("section", "")
-    image_b64 = data["image"]
+    image_b64 = data.get("image")
 
-    # Save temp image
-    img_bytes = base64.b64decode(image_b64)
+    if not all([name, roll_no, image_b64]):
+        return jsonify({"success": False, "error": "name, roll_no and image are required"}), 400
+
     temp_path = f"temp_{roll_no}.jpg"
-    with open(temp_path, "wb") as f:
-        f.write(img_bytes)
 
     try:
+        # Decode and save temp image
+        img_bytes = base64.b64decode(image_b64)
+        with open(temp_path, "wb") as f:
+            f.write(img_bytes)
+
         # Get face embedding
-        embedding = DeepFace.represent(
+        result = DeepFace.represent(
             img_path=temp_path,
             model_name="Facenet",
             enforce_detection=True
-        )[0]["embedding"]
+        )
+        embedding = result[0]["embedding"]
 
         db = get_db()
         cursor = db.cursor()
 
-        # Insert student
+        # Insert or update student
         cursor.execute("""
             INSERT INTO students (name, roll_no, email, section)
             VALUES (%s, %s, %s, %s)
@@ -57,13 +78,16 @@ def enroll():
 
         # Get student id
         cursor.execute("SELECT id FROM students WHERE roll_no = %s", (roll_no,))
-        student_id = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        if not row:
+            return jsonify({"success": False, "error": "Failed to retrieve student ID"}), 500
+        student_id = row[0]
 
-        # Save embedding
+        # Save embedding (delete old first to avoid duplicates)
+        cursor.execute("DELETE FROM embeddings WHERE student_id = %s", (student_id,))
         cursor.execute("""
             INSERT INTO embeddings (student_id, embedding)
             VALUES (%s, %s)
-            ON DUPLICATE KEY UPDATE embedding=VALUES(embedding)
         """, (student_id, json.dumps(embedding)))
 
         db.commit()
@@ -73,7 +97,7 @@ def enroll():
         return jsonify({"success": True, "message": f"{name} enrolled successfully"})
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return jsonify({"success": False, "error": str(e)}), 500
 
     finally:
         if os.path.exists(temp_path):
@@ -84,20 +108,36 @@ def enroll():
 @app.route("/scan", methods=["POST"])
 def scan():
     data = request.json
-    image_b64 = data["image"]
+    if not data:
+        return jsonify({"success": False, "error": "No JSON body received"}), 400
 
-    img_bytes = base64.b64decode(image_b64)
+    image_b64 = data.get("image")
+    if not image_b64:
+        return jsonify({"success": False, "error": "image field is required"}), 400
+
     temp_path = "temp_group.jpg"
-    with open(temp_path, "wb") as f:
-        f.write(img_bytes)
 
     try:
+        # Decode and save temp image
+        img_bytes = base64.b64decode(image_b64)
+        with open(temp_path, "wb") as f:
+            f.write(img_bytes)
+
         # Detect all faces in group photo
         faces = DeepFace.represent(
             img_path=temp_path,
             model_name="Facenet",
             enforce_detection=False
         )
+
+        if not faces:
+            return jsonify({
+                "success": True,
+                "faces_detected": 0,
+                "matched": [],
+                "matched_count": 0,
+                "message": "No faces detected in the image"
+            })
 
         # Load all embeddings from MySQL
         db = get_db()
@@ -111,7 +151,14 @@ def scan():
         cursor.close()
         db.close()
 
+        if not students:
+            return jsonify({
+                "success": False,
+                "error": "No enrolled students found in database"
+            }), 404
+
         matched_students = []
+        matched_ids = set()  # avoid duplicate matches
 
         for face in faces:
             face_embedding = np.array(face["embedding"])
@@ -125,7 +172,8 @@ def scan():
                     best_score = distance
                     best_match = student
 
-            if best_score < 10 and best_match:
+            if best_score < 10 and best_match and best_match[0] not in matched_ids:
+                matched_ids.add(best_match[0])
                 matched_students.append({
                     "student_id": best_match[0],
                     "name": best_match[1],
@@ -142,7 +190,7 @@ def scan():
         })
 
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)})
+        return jsonify({"success": False, "error": str(e)}), 500
 
     finally:
         if os.path.exists(temp_path):
@@ -153,38 +201,52 @@ def scan():
 @app.route("/save-attendance", methods=["POST"])
 def save_attendance():
     data = request.json
-    class_name = data["class_name"]
-    subject    = data["subject"]
-    date       = data["date"]
-    students   = data["students"]  # list from /scan response
+    if not data:
+        return jsonify({"success": False, "error": "No JSON body received"}), 400
 
-    db = get_db()
-    cursor = db.cursor()
+    class_name = data.get("class_name")
+    subject    = data.get("subject")
+    date       = data.get("date")
+    students   = data.get("students", [])
 
-    # Create session
-    cursor.execute("""
-        INSERT INTO sessions (class_name, subject, session_date)
-        VALUES (%s, %s, %s)
-    """, (class_name, subject, date))
-    session_id = cursor.lastrowid
+    if not all([class_name, subject, date]):
+        return jsonify({"success": False, "error": "class_name, subject and date are required"}), 400
 
-    # Insert attendance for each matched student
-    for student in students:
+    if not students:
+        return jsonify({"success": False, "error": "No students to mark attendance for"}), 400
+
+    try:
+        db = get_db()
+        cursor = db.cursor()
+
+        # Create session
         cursor.execute("""
-            INSERT INTO attendance (student_id, session_id, status, confidence)
-            VALUES (%s, %s, 'present', %s)
-        """, (student["student_id"], session_id, student["confidence"]))
+            INSERT INTO sessions (class_name, subject, session_date)
+            VALUES (%s, %s, %s)
+        """, (class_name, subject, date))
+        session_id = cursor.lastrowid
 
-    db.commit()
-    cursor.close()
-    db.close()
+        # Insert attendance for each matched student
+        for student in students:
+            cursor.execute("""
+                INSERT INTO attendance (student_id, session_id, status, confidence)
+                VALUES (%s, %s, 'present', %s)
+            """, (student["student_id"], session_id, student.get("confidence", 0)))
 
-    return jsonify({
-        "success": True,
-        "session_id": session_id,
-        "students_marked": len(students)
-    })
+        db.commit()
+        cursor.close()
+        db.close()
+
+        return jsonify({
+            "success": True,
+            "session_id": session_id,
+            "students_marked": len(students)
+        })
+
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=True)
