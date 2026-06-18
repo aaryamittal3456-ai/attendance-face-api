@@ -4,34 +4,68 @@ import base64
 import os
 import json
 import numpy as np
-import mysql.connector
-from mysql.connector import Error
+import psycopg2
+import psycopg2.extras
 
 app = Flask(__name__)
 
-# ── MySQL connection ───────────────────────────────────
-DB_CONFIG = {
-    "host": os.environ.get("DB_HOST", "localhost"),
-    "user": os.environ.get("DB_USER", "root"),
-    "password": os.environ.get("DB_PASSWORD", "MyNewPasswordUpdated"),
-    "database": os.environ.get("DB_NAME", "attendance_db"),
-    "port": int(os.environ.get("DB_PORT", 3306))
-}
-
+# ── PostgreSQL connection ──────────────────────────────
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://attendance_db_tvyg_user:tiro6Kyyb6oFXphc6DJAjuWLithvDMZF@dpg-d8pce6pkh4rs7394g6hg-a.singapore-postgres.render.com/attendance_db_tvyg"
+)
 
 def get_db():
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        return conn
-    except Error as e:
-        raise Exception(f"Database connection failed: {str(e)}")
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    return conn
 
+# ── Create tables if not exist ─────────────────────────
+def init_db():
+    try:
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS students (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100),
+                roll_no VARCHAR(20) UNIQUE,
+                email VARCHAR(100),
+                section VARCHAR(50),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS embeddings (
+                id SERIAL PRIMARY KEY,
+                student_id INT REFERENCES students(id),
+                embedding TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                id SERIAL PRIMARY KEY,
+                class_name VARCHAR(100),
+                subject VARCHAR(100),
+                session_date DATE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS attendance (
+                id SERIAL PRIMARY KEY,
+                student_id INT REFERENCES students(id),
+                session_id INT REFERENCES sessions(id),
+                status VARCHAR(10) DEFAULT 'present',
+                confidence FLOAT,
+                marked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        db.commit()
+        cursor.close()
+        db.close()
+        print("Database tables ready.")
+    except Exception as e:
+        print(f"DB init error: {e}")
 
 # ── Health check ───────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "running", "message": "Attendance Face API is live"})
-
 
 # ── Enroll a student ───────────────────────────────────
 @app.route("/enroll", methods=["POST"])
@@ -52,12 +86,10 @@ def enroll():
     temp_path = f"temp_{roll_no}.jpg"
 
     try:
-        # Decode and save temp image
         img_bytes = base64.b64decode(image_b64)
         with open(temp_path, "wb") as f:
             f.write(img_bytes)
 
-        # Get face embedding
         result = DeepFace.represent(
             img_path=temp_path,
             model_name="Facenet",
@@ -72,18 +104,14 @@ def enroll():
         cursor.execute("""
             INSERT INTO students (name, roll_no, email, section)
             VALUES (%s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-            name=VALUES(name), email=VALUES(email), section=VALUES(section)
+            ON CONFLICT (roll_no) DO UPDATE
+            SET name=EXCLUDED.name, email=EXCLUDED.email, section=EXCLUDED.section
         """, (name, roll_no, email, section))
 
-        # Get student id
         cursor.execute("SELECT id FROM students WHERE roll_no = %s", (roll_no,))
-        row = cursor.fetchone()
-        if not row:
-            return jsonify({"success": False, "error": "Failed to retrieve student ID"}), 500
-        student_id = row[0]
+        student_id = cursor.fetchone()[0]
 
-        # Save embedding (delete old first to avoid duplicates)
+        # Delete old embedding and insert new
         cursor.execute("DELETE FROM embeddings WHERE student_id = %s", (student_id,))
         cursor.execute("""
             INSERT INTO embeddings (student_id, embedding)
@@ -118,12 +146,10 @@ def scan():
     temp_path = "temp_group.jpg"
 
     try:
-        # Decode and save temp image
         img_bytes = base64.b64decode(image_b64)
         with open(temp_path, "wb") as f:
             f.write(img_bytes)
 
-        # Detect all faces in group photo
         faces = DeepFace.represent(
             img_path=temp_path,
             model_name="Facenet",
@@ -135,11 +161,9 @@ def scan():
                 "success": True,
                 "faces_detected": 0,
                 "matched": [],
-                "matched_count": 0,
-                "message": "No faces detected in the image"
+                "matched_count": 0
             })
 
-        # Load all embeddings from MySQL
         db = get_db()
         cursor = db.cursor()
         cursor.execute("""
@@ -152,13 +176,10 @@ def scan():
         db.close()
 
         if not students:
-            return jsonify({
-                "success": False,
-                "error": "No enrolled students found in database"
-            }), 404
+            return jsonify({"success": False, "error": "No enrolled students found"}), 404
 
         matched_students = []
-        matched_ids = set()  # avoid duplicate matches
+        matched_ids = set()
 
         for face in faces:
             face_embedding = np.array(face["embedding"])
@@ -197,7 +218,7 @@ def scan():
             os.remove(temp_path)
 
 
-# ── Save attendance record ─────────────────────────────
+# ── Save attendance ────────────────────────────────────
 @app.route("/save-attendance", methods=["POST"])
 def save_attendance():
     data = request.json
@@ -209,24 +230,19 @@ def save_attendance():
     date       = data.get("date")
     students   = data.get("students", [])
 
-    if not all([class_name, subject, date]):
-        return jsonify({"success": False, "error": "class_name, subject and date are required"}), 400
-
-    if not students:
-        return jsonify({"success": False, "error": "No students to mark attendance for"}), 400
+    if not all([class_name, subject, date, students]):
+        return jsonify({"success": False, "error": "class_name, subject, date and students are required"}), 400
 
     try:
         db = get_db()
         cursor = db.cursor()
 
-        # Create session
         cursor.execute("""
             INSERT INTO sessions (class_name, subject, session_date)
-            VALUES (%s, %s, %s)
+            VALUES (%s, %s, %s) RETURNING id
         """, (class_name, subject, date))
-        session_id = cursor.lastrowid
+        session_id = cursor.fetchone()[0]
 
-        # Insert attendance for each matched student
         for student in students:
             cursor.execute("""
                 INSERT INTO attendance (student_id, session_id, status, confidence)
@@ -248,5 +264,6 @@ def save_attendance():
 
 
 if __name__ == "__main__":
+    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
