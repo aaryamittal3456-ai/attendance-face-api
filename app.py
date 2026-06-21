@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
-import face_recognition
+import mediapipe as mp
+import cv2
 import base64
 import os
 import json
@@ -61,10 +62,54 @@ def init_db():
     except Exception as e:
         print(f"DB init error: {e}")
 
+
+# ── MediaPipe face detector + embedder ─────────────────
+mp_face_detection = mp.solutions.face_detection
+face_detector = mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5)
+
+
+def get_face_crops(image_bgr):
+    """Detect faces and return list of cropped face images (resized, grayscale-flattened vectors)."""
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    results = face_detector.process(image_rgb)
+
+    crops = []
+    if results.detections:
+        h, w, _ = image_bgr.shape
+        for detection in results.detections:
+            box = detection.location_data.relative_bounding_box
+            x = max(int(box.xmin * w), 0)
+            y = max(int(box.ymin * h), 0)
+            bw = int(box.width * w)
+            bh = int(box.height * h)
+            face_crop = image_bgr[y:y + bh, x:x + bw]
+            if face_crop.size > 0:
+                crops.append(face_crop)
+    return crops
+
+
+def get_embedding(face_crop):
+    """Generate a simple but effective embedding using resized grayscale pixel histogram + HOG-like features."""
+    face_resized = cv2.resize(face_crop, (100, 100))
+    gray = cv2.cvtColor(face_resized, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+
+    # Compute HOG features (lightweight, no heavy model needed)
+    win_size = (100, 100)
+    block_size = (20, 20)
+    block_stride = (10, 10)
+    cell_size = (10, 10)
+    nbins = 9
+    hog = cv2.HOGDescriptor(win_size, block_size, block_stride, cell_size, nbins)
+    features = hog.compute(gray)
+    return features.flatten()
+
+
 # ── Health check ───────────────────────────────────────
 @app.route("/", methods=["GET"])
 def health():
     return jsonify({"status": "running", "message": "Attendance Face API is live"})
+
 
 # ── Enroll a student ───────────────────────────────────
 @app.route("/enroll", methods=["POST"])
@@ -82,26 +127,23 @@ def enroll():
     if not all([name, roll_no, image_b64]):
         return jsonify({"success": False, "error": "name, roll_no and image are required"}), 400
 
-    temp_path = f"temp_{roll_no}.jpg"
-
     try:
         img_bytes = base64.b64decode(image_b64)
-        with open(temp_path, "wb") as f:
-            f.write(img_bytes)
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        image_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-        # Load image and get face encoding (dlib-based, lightweight)
-        image = face_recognition.load_image_file(temp_path)
-        face_encodings = face_recognition.face_encodings(image)
+        if image_bgr is None:
+            return jsonify({"success": False, "error": "Could not decode image"}), 400
 
-        if not face_encodings:
+        crops = get_face_crops(image_bgr)
+        if not crops:
             return jsonify({"success": False, "error": "No face detected in the image"}), 400
 
-        embedding = face_encodings[0].tolist()
+        embedding = get_embedding(crops[0]).tolist()
 
         db = get_db()
         cursor = db.cursor()
 
-        # Insert or update student
         cursor.execute("""
             INSERT INTO students (name, roll_no, email, section)
             VALUES (%s, %s, %s, %s)
@@ -112,7 +154,6 @@ def enroll():
         cursor.execute("SELECT id FROM students WHERE roll_no = %s", (roll_no,))
         student_id = cursor.fetchone()[0]
 
-        # Delete old embedding and insert new
         cursor.execute("DELETE FROM embeddings WHERE student_id = %s", (student_id,))
         cursor.execute("""
             INSERT INTO embeddings (student_id, embedding)
@@ -128,10 +169,6 @@ def enroll():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
 
 # ── Scan group photo ───────────────────────────────────
 @app.route("/scan", methods=["POST"])
@@ -144,18 +181,16 @@ def scan():
     if not image_b64:
         return jsonify({"success": False, "error": "image field is required"}), 400
 
-    temp_path = "temp_group.jpg"
-
     try:
         img_bytes = base64.b64decode(image_b64)
-        with open(temp_path, "wb") as f:
-            f.write(img_bytes)
+        np_arr = np.frombuffer(img_bytes, np.uint8)
+        image_bgr = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-        image = face_recognition.load_image_file(temp_path)
-        face_locations = face_recognition.face_locations(image)
-        face_encodings = face_recognition.face_encodings(image, face_locations)
+        if image_bgr is None:
+            return jsonify({"success": False, "error": "Could not decode image"}), 400
 
-        if not face_encodings:
+        crops = get_face_crops(image_bgr)
+        if not crops:
             return jsonify({
                 "success": True,
                 "faces_detected": 0,
@@ -177,44 +212,45 @@ def scan():
         if not students:
             return jsonify({"success": False, "error": "No enrolled students found"}), 404
 
-        known_encodings = [np.array(json.loads(s[4])) for s in students]
+        known_embeddings = [np.array(json.loads(s[4])) for s in students]
 
         matched_students = []
         matched_ids = set()
 
-        for face_encoding in face_encodings:
-            # Compare against all known faces
-            distances = face_recognition.face_distance(known_encodings, face_encoding)
-            best_idx = int(np.argmin(distances))
-            best_distance = distances[best_idx]
+        for crop in crops:
+            face_embedding = get_embedding(crop)
 
-            # Lower distance = better match. 0.6 is the standard threshold.
-            if best_distance < 0.6:
+            best_idx = None
+            best_distance = float("inf")
+
+            for idx, known in enumerate(known_embeddings):
+                distance = np.linalg.norm(face_embedding - known)
+                if distance < best_distance:
+                    best_distance = distance
+                    best_idx = idx
+
+            # Threshold tuned for HOG feature distance
+            if best_idx is not None and best_distance < 15 and students[best_idx][0] not in matched_ids:
                 student = students[best_idx]
-                if student[0] not in matched_ids:
-                    matched_ids.add(student[0])
-                    confidence = round((1 - best_distance) * 100, 2)
-                    matched_students.append({
-                        "student_id": student[0],
-                        "name": student[1],
-                        "roll_no": student[2],
-                        "email": student[3],
-                        "confidence": confidence
-                    })
+                matched_ids.add(student[0])
+                confidence = round(max(0, (1 - best_distance / 25) * 100), 2)
+                matched_students.append({
+                    "student_id": student[0],
+                    "name": student[1],
+                    "roll_no": student[2],
+                    "email": student[3],
+                    "confidence": confidence
+                })
 
         return jsonify({
             "success": True,
-            "faces_detected": len(face_encodings),
+            "faces_detected": len(crops),
             "matched": matched_students,
             "matched_count": len(matched_students)
         })
 
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
 
 
 # ── Save attendance ────────────────────────────────────
