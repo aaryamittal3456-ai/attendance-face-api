@@ -1,11 +1,10 @@
 from flask import Flask, request, jsonify
-from deepface import DeepFace
+import face_recognition
 import base64
 import os
 import json
 import numpy as np
 import psycopg2
-import psycopg2.extras
 
 app = Flask(__name__)
 
@@ -90,12 +89,14 @@ def enroll():
         with open(temp_path, "wb") as f:
             f.write(img_bytes)
 
-        result = DeepFace.represent(
-            img_path=temp_path,
-            model_name="Facenet",
-            enforce_detection=True
-        )
-        embedding = result[0]["embedding"]
+        # Load image and get face encoding (dlib-based, lightweight)
+        image = face_recognition.load_image_file(temp_path)
+        face_encodings = face_recognition.face_encodings(image)
+
+        if not face_encodings:
+            return jsonify({"success": False, "error": "No face detected in the image"}), 400
+
+        embedding = face_encodings[0].tolist()
 
         db = get_db()
         cursor = db.cursor()
@@ -150,13 +151,11 @@ def scan():
         with open(temp_path, "wb") as f:
             f.write(img_bytes)
 
-        faces = DeepFace.represent(
-            img_path=temp_path,
-            model_name="Facenet",
-            enforce_detection=False
-        )
+        image = face_recognition.load_image_file(temp_path)
+        face_locations = face_recognition.face_locations(image)
+        face_encodings = face_recognition.face_encodings(image, face_locations)
 
-        if not faces:
+        if not face_encodings:
             return jsonify({
                 "success": True,
                 "faces_detected": 0,
@@ -178,34 +177,34 @@ def scan():
         if not students:
             return jsonify({"success": False, "error": "No enrolled students found"}), 404
 
+        known_encodings = [np.array(json.loads(s[4])) for s in students]
+
         matched_students = []
         matched_ids = set()
 
-        for face in faces:
-            face_embedding = np.array(face["embedding"])
-            best_match = None
-            best_score = float("inf")
+        for face_encoding in face_encodings:
+            # Compare against all known faces
+            distances = face_recognition.face_distance(known_encodings, face_encoding)
+            best_idx = int(np.argmin(distances))
+            best_distance = distances[best_idx]
 
-            for student in students:
-                stored = np.array(json.loads(student[4]))
-                distance = np.linalg.norm(face_embedding - stored)
-                if distance < best_score:
-                    best_score = distance
-                    best_match = student
-
-            if best_score < 10 and best_match and best_match[0] not in matched_ids:
-                matched_ids.add(best_match[0])
-                matched_students.append({
-                    "student_id": best_match[0],
-                    "name": best_match[1],
-                    "roll_no": best_match[2],
-                    "email": best_match[3],
-                    "confidence": round((1 - best_score / 20) * 100, 2)
-                })
+            # Lower distance = better match. 0.6 is the standard threshold.
+            if best_distance < 0.6:
+                student = students[best_idx]
+                if student[0] not in matched_ids:
+                    matched_ids.add(student[0])
+                    confidence = round((1 - best_distance) * 100, 2)
+                    matched_students.append({
+                        "student_id": student[0],
+                        "name": student[1],
+                        "roll_no": student[2],
+                        "email": student[3],
+                        "confidence": confidence
+                    })
 
         return jsonify({
             "success": True,
-            "faces_detected": len(faces),
+            "faces_detected": len(face_encodings),
             "matched": matched_students,
             "matched_count": len(matched_students)
         })
